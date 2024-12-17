@@ -9,6 +9,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - none
 
+## [1.0.2] - 2024-12-17
+
+### Fixed
+
+- Failure to run when there is no configuration file
+- Repeat N times fails to run properly in some instances
+
 ## [1.0.1] - 2024-12-17
 
 ### Changed

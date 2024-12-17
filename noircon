@@ -6,7 +6,7 @@
 
 # App version and name
 APP_NAME="NoirCon"
-VERSION=1.0.1
+VERSION=1.0.2
 LAST_UPDATED="2024-12-17"
 
 # ==============================
@@ -25,7 +25,7 @@ DEPENDENCIES=("nc" "openssl" "timeout" "whois")
 
 # Default configuration file location (full default path added during initialization)
 CONFIG_FILE_NAME="$(basename "$0").json"
-SKIP_CONFIG_KEYS=("CONFIG_FILE" "PID_FILE")
+SKIP_CONFIG_KEYS=("PID_FILE")
 
 # Master directory to store all cache files (full default path added during initialization)
 CACHE_DIR="$(basename "$0")_cache"
@@ -802,9 +802,12 @@ start_process() {
 # Function: Load configuration from JSON file
 load_config() {
     local config_file_path="$1"
-    if [[ ! -f "$config_file_path" ]]; then
+
+    if key_exists "CONFIG_FILE" SKIP_CONFIG_KEYS[@] && [[ ! -f "$config_file_path" ]]; then
         log_message "FATAL" "Configuration file not found: $config_file_path" "$LINENO"
         exit 1
+    elif ! key_exists "CONFIG_FILE" SKIP_CONFIG_KEYS[@] && [[ ! -f "$config_file_path" ]]; then
+        return 0
     fi
 
     # Use jq to parse the JSON and set environment variables
@@ -814,7 +817,7 @@ load_config() {
 
     while IFS="=" read -r key value; do
         # Skip empty lines, invalid entries, or keys that are in the skip_keys array
-        if [[ -n "$key" && -n "$value" && ! " ${SKIP_CONFIG_KEYS[@]} " =~ " ${key} " ]]; then
+        if [[ -n "$key" && -n "$value" && ! " ${SKIP_CONFIG_KEYS[@]} " =~ " ${key} " && "$key" != "CONFIG_FILE" ]]; then
             [[ "$key" == *_DIR || "$key" == *_FILE || "$key" == *_CMD ]] && value="$(normalize_path "$value")"
             export "$key"="$value"
             log_message "DEBUG" "Setting $key=$value" "$LINENO"
@@ -826,6 +829,17 @@ load_config() {
 get_connection_groups() {
     local config_file_path="$1"
     jq -r '.connections | keys | sort[]' "$config_file_path"
+}
+
+# Function: Check if a key exists in the SKIP_CONFIG_KEYS
+key_exists() {
+    local key="$1"
+
+    if [[ " ${SKIP_CONFIG_KEYS[@]} " =~ " ${key} " ]]; then
+        return 0 # Key exists
+    fi
+
+    return 1 # Key does not exist
 }
 
 # Function: Get connection settings as key-value pairs
@@ -1983,7 +1997,7 @@ main() {
         log_message "DEBUG" "Iteration: $repeat_count" "$LINENO"
 
         # Check if REPEAT is set and not zero
-        if [[ -n "$REPEAT" || "$REPEAT" -ne 0 ]] && [[ "$repeat_count" -ge "$REPEAT" ]]; then
+        if [[ -z "$REPEAT" || "$REPEAT" != 0 ]] && [[ "$repeat_count" -ge "$REPEAT" ]]; then
             log_message "DEBUG" "Reached the maximum number of repetitions: $REPEAT" "$LINENO"
             break
         else
