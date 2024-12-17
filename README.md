@@ -272,7 +272,7 @@ Run the script with the desired options. Below are some examples:
 
 ## Configuration
 
-NoirCon uses a configuration file to store default settings. The default location is `~/.config/noircon.conf`. You can initialize a configuration file with default settings using:
+NoirCon uses a configuration file to store default settings. The default location is `~/.config/noircon.json`. You can initialize a configuration file with default settings using:
 
 ```bash
 ./noircon --init
@@ -545,7 +545,7 @@ Ensure you have the following installed on your system:
 
    ```bash
    rm -rf ./test_cache
-   rm -f ./test_noircon.log
+   rm -f ./test.log
    ```
 
 ### Summary
