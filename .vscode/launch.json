@@ -1,0 +1,21 @@
+{
+    // Use IntelliSense to learn about possible attributes.
+    // Hover to view descriptions of existing attributes.
+    // For more information, visit: https://go.microsoft.com/fwlink/?linkid=830387
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "type": "bashdb",
+            "request": "launch",
+            "name": "Bash-Debug (simplest configuration)",
+            "program": "${file}",
+            "argsString": " -c ./test/test.json --log-level DEBUG -v -S",
+            // "argsString": " -c ./test/test.json -C ./test/cache -S -L DEBUG -v",
+            // "argsString": " -N 1 -c ./test/test.json -L DEBUG -v --force",
+            // "argsString": " -c ./test/test.json -Z"
+            // "argsString": " -E"
+            // "argsString": "-L TRACE" // test invalid log level
+            // "argsString": "--clean" // test clean
+        }
+    ]
+}

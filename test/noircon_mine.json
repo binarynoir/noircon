@@ -1,0 +1,48 @@
+{
+	"configuration": {
+		"CACHE_DIR": "/tmp/noircon_cache",
+		"LOG_FILE": "/tmp/noircon_cache/noircon.log",
+		"CHECK_INTERVAL": "60s",
+		"TIMEOUT": "5s",
+		"SYSTEM_NAME": "Johns-MacBook-Pro",
+		"PUSHOVER_NOTIFICATION": "true",
+		"PUSHOVER_USER_KEY": "uxp2pwaggf54gbtw6cqf5xjzjrf34j",
+		"PUSHOVER_API_TOKEN": "af3hy357dgtfhxzy9owc3vij95fqd4",
+		"DESKTOP_NOTIFICATION": "true",
+		"VERBOSE": "true",
+		"LOG_LEVEL": "DEBUG"
+	},
+	"connections": {
+		"binarynoir": [
+			{
+				"NAME": "Server",
+				"TYPE": "PING",
+				"HOST": "binarynoir.tech",
+				"TIMEOUT": "5s"
+			},
+			{
+				"NAME": "Website",
+				"TYPE": "HTTP",
+				"URL": "https://binarynoir.tech",
+				"PORT": "443",
+				"TIMEOUT": "5s"
+			},
+			{
+				"NAME": "Cert Expiry",
+				"TYPE": "CERT",
+				"DOMAIN": "binarynoir.tech",
+				"EXPIRY_DAYS": "30d",
+				"TIMEOUT": "30s",
+				"CHECK_FREQUENCY": "30d"
+			},
+			{
+				"NAME": "Domain Expiry",
+				"TYPE": "DOMAIN",
+				"DOMAIN": "binarynoir.tech",
+				"EXPIRY_DAYS": "365d",
+				"TIMEOUT": "5",
+				"CHECK_FREQUENCY": "60d"
+			}
+		]
+	}
+}

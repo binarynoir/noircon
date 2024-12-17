@@ -1,0 +1,138 @@
+.TH NOIRCON 1 "December 17, 2024" "NoirCon 1.0.0" "User Commands"
+.SH NAME
+NoirCon \- Monitors addresses to check their availability and sends notifications.
+.SH SYNOPSIS
+.B noircon
+[\fIoptions\fR]
+.SH DESCRIPTION
+.B NoirCon
+is a script designed to monitor various types of addresses (e.g., IP addresses, URLs) to check their availability and send notifications based on the results. It supports multiple connection types and notification methods.
+.SH OPTIONS
+.TP
+.B \-h, \-\-help
+Display this help message.
+.TP
+.B \-V, \-\-version
+Display the application version.
+.TP
+.B \-c, \-\-config \fI<config_file>\fR
+Specify a custom configuration file (default: noircon.json).
+.TP
+.B \-i, \-\-init
+Initialize the configuration file.
+.TP
+.B \-f, \-\-force\-init
+Force initialization of the configuration file if one exists.
+.TP
+.B \-S, \-\-show\-config
+Show the configuration settings.
+.TP
+.B \-e, \-\-show\-config\-file
+Show the configuration file.
+.TP
+.B \-E, \-\-edit\-config
+Edit the configuration file.
+.TP
+.B \-x, \-\-clean
+Delete all cached files.
+.TP
+.B \-C, \-\-cache\-dir \fI<path>\fR
+Specify a custom cache directory (default: noircon_cache).
+.TP
+.B \-n, \-\-system\-name \fI<name>\fR
+Name of the system running the script (default: hostname).
+.TP
+.B \-p, \-\-pushover
+Send Pushover notifications.
+.TP
+.B \-u, \-\-user\-key \fI<key>\fR
+Specify the user key for Pushover notifications.
+.TP
+.B \-a, \-\-api\-token \fI<token>\fR
+Specify the API token for Pushover notifications.
+.TP
+.B \-d, \-\-desktop
+Send desktop notifications using AppleScript.
+.TP
+.B \-v, \-\-verbose
+Enable verbose output.
+.TP
+.B \-l, \-\-log
+Log the log file to the screen.
+.TP
+.B \-o, \-\-output \fI<file>\fR
+Specify a custom log file location (default: noircon.log).
+.TP
+.B \-L, \-\-log\-level \fI<level>\fR
+Set the log level (FATAL, ERROR, WARN, INFO, DEBUG).
+.TP
+.B \-I, \-\-interval \fI<s,m,h,d>\fR
+Set the interval between checks (default: 60s).
+.TP
+.B \-T, \-\-timeout \fI<s,m,h,d>\fR
+Set the connection timeout for remote connections (default: 5s).
+.TP
+.B \-N, \-\-repeat \fI<number>\fR
+Repeat the checks in interactive mode N number of times and exit (default: 0).
+.TP
+.B \-Z, \-\-list\-connections
+List the current status of all remote connections.
+.TP
+.B \-H, \-\-history
+Output a history of the connections to the screen.
+.TP
+.B \-F, \-\-force
+Ignore the check frequency and check all connections.
+.TP
+.B \-s, \-\-start
+Start the NoirCon service in the background.
+.TP
+.B \-k, \-\-stop
+Stop the NoirCon service.
+.TP
+.B \-r, \-\-restart
+Restart the NoirCon service.
+.TP
+.B \-t, \-\-status
+Check the current status of the NoirCon service.
+.SH EXAMPLES
+Run interactively with default settings:
+.EX
+noircon
+.EE
+Start the service with default settings:
+.EX
+noircon \-\-start
+.EE
+Restart the service with default settings:
+.EX
+noircon \-\-restart
+.EE
+Check service status:
+.EX
+noircon \-\-status
+.EE
+Stop the service:
+.EX
+noircon \-\-stop
+.EE
+.SH FILES
+.TP
+.B noircon.json
+Default configuration file.
+.TP
+.B noircon_cache/
+Directory for cached files.
+.TP
+.B noircon.log
+Default log file.
+.SH AUTHOR
+John Smith III
+.SH LICENSE
+MIT License
+.SH SEE ALSO
+.BR ping (8),
+.BR curl (1),
+.BR nc (1),
+.BR openssl (1),
+.BR whois (1)

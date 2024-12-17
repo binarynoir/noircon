@@ -1,0 +1,1993 @@
+#!/usr/bin/env bash
+# App Name: NoirCon
+# Description: NoirCon monitors addresses to see if they are available and sends notifications.
+# Author: John Smith III
+# License: MIT License
+
+# App version and name
+APP_NAME="NoirCon"
+VERSION=1.0.0
+LAST_UPDATED="2024-12-10"
+
+# ==============================
+# Application Specific Variables
+# ==============================
+
+# Available connection types
+CONNECTION_TYPE_MAP=("PING" "ICMP" "HTTP" "TCP" "SNMP" "UDP" "CERT" "DOMAIN")
+
+# Application specific dependencies
+DEPENDENCIES=("nc" "openssl" "timeout" "whois")
+
+# ==============================
+# Base Application Variables
+# ==============================
+
+# Default configuration file location (full default path added during initialization)
+CONFIG_FILE_NAME="$(basename "$0").json"
+SKIP_CONFIG_KEYS=("CONFIG_FILE" "PID_FILE")
+
+# Master directory to store all cache files (full default path added during initialization)
+CACHE_DIR="$(basename "$0")_cache"
+
+# Default log file location (full default path added during initialization)
+LOG_FILE_NAME="$(basename "$0").log"
+INIT_FORCE=false
+
+# Lock file (full default path added during initialization)
+PID_FILE_NAME="$(basename "$0").pid"
+
+# Service mode flag
+IS_SERVICE=false
+
+# Default check interval (in seconds)
+CHECK_INTERVAL="60s"
+
+# Default timeout interval (in seconds)
+TIMEOUT="5s"
+
+# Pushover notification options
+PUSHOVER_NOTIFICATION=false
+PUSHOVER_USER_KEY=
+PUSHOVER_API_TOKEN=
+
+# Native desktop notification options
+DESKTOP_NOTIFICATION=false
+
+# Log levels
+# Define log levels directly as an associative array
+declare -A LOG_LEVELS_MAP=(
+    ["FATAL"]=0
+    ["ERROR"]=1
+    ["WARN"]=2
+    ["INFO"]=3
+    ["DEBUG"]=4
+)
+LOG_LEVEL="INFO"
+VERBOSE=false
+
+# System host name
+SYSTEM_NAME=""
+
+# ANSI color codes
+RED='\033[0;31m'
+RED_BG='\033[41m'
+GREEN='\033[0;32m'
+GREEN_BG='\033[42m'
+YELLOW='\033[1;33m'
+YELLOW_BG='\033[43m'
+ORANGE='\033[0;33m'
+ORANGE_BG='\033[43m'
+NC='\033[0m' # No Color
+
+# ==============================
+# Utility Functions
+# ==============================
+
+# Function: Show version information
+show_version() {
+    printf "%s version: %s\n" "$APP_NAME" "$VERSION"
+    printf "Last updated: %s\n" "$LAST_UPDATED"
+}
+
+# Function: Check for required command-line utilities
+check_dependencies() {
+    DEPENDENCIES+=("cat" "curl" "hostname" "jq" "sed")
+
+    case "$OSTYPE" in
+    linux*)
+        DEPENDENCIES+=("realpath")
+        ;;
+    darwin*)
+        DEPENDENCIES+=("grealpath")
+        ;;
+    cygwin* | msys* | win32*)
+        DEPENDENCIES+=("powershell")
+        ;;
+    *)
+        log_message "FATAL" "Unsupported OS: $OSTYPE" "$LINENO"
+        exit 1
+        ;;
+    esac
+
+    for cmd in "${DEPENDENCIES[@]}"; do
+        # Debug log for each dependency being checked
+        log_message "DEBUG" "Checking if dependency '$cmd' is installed..." "$LINENO"
+
+        if ! command -v "$cmd" &>/dev/null; then
+            log_message "FATAL" "Error: $cmd is not installed. Please install it and try again." "$LINENO"
+            exit 1
+        else
+            log_message "DEBUG" "Success: $cmd is installed!" "$LINENO"
+        fi
+    done
+
+    # Optional success debug log
+    log_message "DEBUG" "All dependencies are installed." "$LINENO"
+}
+
+# Function: Get system host name
+get_hostname() {
+    case "$OSTYPE" in
+    linux* | darwin*)
+        hostname
+        ;;
+    cygwin* | msys* | win32*)
+        powershell -NoProfile -Command "[System.Net.Dns]::GetHostName()"
+        ;;
+    *)
+        log_message "FATAL" "Unsupported OS: $OSTYPE" "$LINENO"
+        exit 1
+        ;;
+    esac
+}
+
+# Function: Normalize paths
+normalize_path() {
+    local path="$1"
+    local normalized_path
+
+    case "$OSTYPE" in
+    linux*)
+        if command -v realpath >/dev/null 2>&1; then
+            # Use `realpath -m` for non-existent paths on Linux
+            normalized_path=$(realpath -m "$path" 2>/dev/null || echo "$(realpath -m "$(dirname "$path")")/$(basename "$path")")
+        else
+            echo "realpath not found on Linux" >&2
+            exit 1
+        fi
+        ;;
+    darwin*)
+        if command -v grealpath >/dev/null 2>&1; then
+            # Use `grealpath -m` for non-existent paths on macOS
+            normalized_path=$(grealpath -m "$path" 2>/dev/null || echo "$(grealpath -m "$(dirname "$path")")/$(basename "$path")")
+        else
+            echo "grealpath not found on macOS. Install it using 'brew install coreutils'" >&2
+            exit 1
+        fi
+        ;;
+    cygwin* | msys* | win32*)
+        # Use PowerShell to resolve the path on Windows
+        normalized_path=$(powershell -NoProfile -Command "try { (Resolve-Path -LiteralPath '$path').Path } catch { [System.IO.Path]::GetFullPath('$path') }")
+        ;;
+    *)
+        echo "Unsupported OS: $OSTYPE" >&2
+        exit 1
+        ;;
+    esac
+
+    echo "$normalized_path"
+}
+
+# Function: Normalize filenames
+normalize_filename() {
+    local filename="$1"
+    filename=$(echo "$filename" | tr '[:upper:]' '[:lower:]' | tr ' ' '-' | tr -d '\\/:*?"<>|')
+    echo "$filename"
+}
+
+# Function: Get the root configuration directory and set the config file path
+get_config_path() {
+    local append_path="$1"
+    local config_dir
+
+    case "$OSTYPE" in
+    linux* | darwin*)
+        config_dir="$HOME/.config"
+        ;;
+    cygwin* | msys* | win32*)
+        config_dir="$APPDATA\\"
+        ;;
+    *)
+        log_message "FATAL" "Unsupported OS: $OSTYPE" "$LINENO"
+        exit 1
+        ;;
+    esac
+
+    local full_path="$config_dir/$append_path"
+    echo "$(normalize_path "$full_path")"
+}
+
+# Function: Get the temporary directory path
+get_temp_path() {
+    local append_path="$1"
+    local temp_dir
+
+    case "$OSTYPE" in
+    linux* | darwin*)
+        temp_dir="/tmp"
+        ;;
+    cygwin* | msys* | win32*)
+        temp_dir="$TEMP"
+        ;;
+    *)
+        log_message "FATAL" "Unsupported OS: $OSTYPE" "$LINENO"
+        exit 1
+        ;;
+    esac
+
+    local full_path="$temp_dir/$append_path"
+    echo "$(normalize_path "$full_path")"
+}
+
+# Function: Edit a specified file
+edit_file() {
+    local file="$1"
+
+    if [[ -z "$file" ]]; then
+        log_message "FATAL" "No file specified to edit." "$LINENO"
+        exit 1
+    fi
+
+    if [[ ! -f "$file" ]]; then
+        log_message "FATAL" "File not found: $file" "$LINENO"
+        exit 1
+    fi
+
+    if [[ -n "$EDITOR" ]]; then
+        if command -v "$EDITOR" &>/dev/null; then
+            "$EDITOR" "$file"
+            exit 0
+        else
+            log_message "FATAL" "Specified editor '$EDITOR' is not available." "$LINENO"
+            exit 1
+        fi
+    fi
+
+    case "$OSTYPE" in
+    darwin*)
+        open "$file"
+        ;;
+    linux*)
+        xdg-open "$file"
+        ;;
+    cygwin* | msys* | win32*)
+        start "" "$file"
+        ;;
+    *)
+        log_message "FATAL" "Unsupported OS: $OSTYPE" "$LINENO"
+        exit 1
+        ;;
+    esac
+
+    exit 0
+}
+
+# Function: Convert a frequency/interval string to seconds
+get_interval_in_seconds() {
+    local input_frequency="$1" # Input frequency/interval string
+    local interval             # Variable to store the converted interval in seconds
+
+    # Check if the input is a number without any unit
+    if [[ "$input_frequency" =~ ^[0-9]+$ ]]; then
+        interval=$input_frequency # Default to seconds if no unit is specified
+    else
+        # Determine the unit and convert accordingly
+        case "${input_frequency: -1}" in
+        s) interval=${input_frequency%?} ;;              # Seconds
+        m) interval=$((${input_frequency%?} * 60)) ;;    # Minutes to seconds
+        h) interval=$((${input_frequency%?} * 3600)) ;;  # Hours to seconds
+        d) interval=$((${input_frequency%?} * 86400)) ;; # Days to seconds
+        *)
+            echo "Invalid frequency format"
+            return 1
+            ;; # Handle invalid formats
+        esac
+    fi
+
+    echo "$interval" # Return the interval in seconds
+}
+
+# Function: Convert date to human-readable format
+convert_date() {
+    local date_str="$1"
+    local human_readable_date
+
+    if [[ "$OSTYPE" == "linux"* ]]; then
+        human_readable_date=$(date -d "$date_str" +"%Y-%m-%d %H:%M:%S %Z")
+    elif [[ "$OSTYPE" == "darwin"* ]]; then
+        human_readable_date=$(date -j -f "%Y-%m-%dT%H:%M:%SZ" "$date_str" +"%Y-%m-%d %H:%M:%S %Z")
+    elif [[ "$OSTYPE" == "cygwin" || "$OSTYPE" == "msys" || "$OSTYPE" == "win32" ]]; then
+        human_readable_date=$(date -d "$date_str" +"%Y-%m-%d %H:%M:%S %Z")
+    else
+        human_readable_date="$date_str"
+    fi
+
+    echo "$human_readable_date"
+}
+
+# ==============================
+# Logging and Messaging Functions
+# ==============================
+
+# Function: Check if the current log level is at or above a given level
+log_at_or_above() {
+    local level_name=$1
+
+    # Get indices from the associative array
+    local current_level_index=${LOG_LEVELS_MAP[$LOG_LEVEL]}
+    local check_level_index=${LOG_LEVELS_MAP[$level_name]}
+
+    # Compare indices
+    if [[ $current_level_index -ge $check_level_index ]]; then
+        return 0 # true: log level is at or above the given level
+    else
+        return 1 # false: log level is below the given level
+    fi
+}
+
+# Function: Log messages to console
+log_to_console() {
+    local log_level_name=$1
+    local message=$2
+    local line_number=$3
+    # Generate an ISO 8601 timestamp in UTC
+    local timestamp=$(date -u "+%Y-%m-%dT%H:%M:%SZ")
+    local output_message="$message"
+
+    # If verbose mode or debug level is enabled, format the output with timestamp and log level
+    if [[ "$VERBOSE" = true || "$LOG_LEVEL" = "DEBUG" ]]; then
+        output_message="$timestamp [$log_level_name] $message (Line: $line_number)"
+    fi
+
+    # Escape special characters to avoid issues with printf
+    local safe_message=$(printf "%s" "$output_message" | sed 's/[^[:print:]\t]//g') # Remove non-printable characters
+
+    # Handle different log levels
+    case $log_level_name in
+    "FATAL")
+        printf "${RED_BG}%b${NC}\n" "$safe_message" >&2
+        ;;
+    "ERROR")
+        printf "${RED}%b${NC}\n" "$safe_message" >&2
+        ;;
+    "WARN")
+        printf "${YELLOW}%b${NC}\n" "$safe_message" >&2
+        ;;
+    *)
+        printf "%b${NC}\n" "$safe_message" >&2
+        ;;
+    esac
+}
+
+# Function: Log messages
+log_message() {
+    local log_level_name=$1
+    local message=$2
+    local line_number=${3:-"N/A"}
+    local timestamp=$(date -u "+%Y-%m-%dT%H:%M:%SZ")
+
+    # Validate log level name
+    local log_level_index=${LOG_LEVELS_MAP[$log_level_name]}
+    if [[ -z "$log_level_index" ]]; then
+        log_level_name="INFO"
+        log_level_index=${LOG_LEVELS_MAP[$log_level_name]}
+        printf "%s\n" "$timestamp [ERROR] Invalid log level specified. Defaulting to INFO." >&2
+    fi
+
+    # Validate current log level
+    local current_log_level_index=${LOG_LEVELS_MAP[$LOG_LEVEL]}
+    if [[ -z "$current_log_level_index" ]]; then
+        printf "%s\n" "$timestamp [ERROR] Invalid global log level. Defaulting to INFO." >&2
+        LOG_LEVEL="INFO"
+        current_log_level_index=${LOG_LEVELS_MAP[$LOG_LEVEL]}
+    fi
+
+    # Format the log message
+    local formatted_message="$timestamp [$log_level_name] $message"
+    if [[ "$VERBOSE" = true || "$LOG_LEVEL" = "DEBUG" ]]; then
+        formatted_message="$formatted_message (Line: $line_number)"
+    fi
+
+    # Escape special characters in the message to prevent breaking formatting
+    local safe_message=$(printf "%s" "$formatted_message" | sed 's/[^[:print:]\t]//g')
+
+    # Log to file if the log level meets the criteria and the log file exists
+    if log_at_or_above "$log_level_name" && [[ -f "$LOG_FILE" ]]; then
+        printf "%s\n" "$safe_message" >>"$LOG_FILE" 2>/dev/null || true
+    fi
+
+    # Always log to the console if not running as a service, or if no log file exists
+    if [[ "$IS_SERVICE" != true || ! -f "$LOG_FILE" ]] && log_at_or_above "$log_level_name"; then
+        log_to_console "$log_level_name" "$message" "$line_number"
+    fi
+}
+
+# Function: Initialize the log file
+init_log() {
+    # Ensure the directory for the log file exists
+    log_dir=$(dirname "$LOG_FILE")
+    if [ ! -d "$log_dir" ]; then
+        printf "Log file directory %s does not exist. Creating it...\n" "$log_dir"
+        mkdir -p "$log_dir" || {
+            log_message "FATAL" "Failed to create directory: $log_dir" "$LINENO"
+            exit 1
+        }
+    fi
+
+    if [ -z "$LOG_FILE" ]; then
+        log_message "FATAL" "LOG_FILE variable is not set." "$LINENO"
+        exit 1
+    fi
+
+    if [ ! -f "$LOG_FILE" ]; then
+        # Attempt to create the log file
+        if touch "$LOG_FILE" 2>/dev/null; then
+            log_message "DEBUG" "Created log file: $LOG_FILE" "$LINENO"
+        else
+            log_message "FATAL" "Failed to create log file: $LOG_FILE" "$LINENO"
+            exit 1
+        fi
+    else
+        # Check if the log file is writable
+        if [ ! -w "$LOG_FILE" ]; then
+            log_message "FATAL" "Log file exists but is not writable: $LOG_FILE" "$LINENO"
+            exit 1
+        fi
+        log_message "DEBUG" "Log file already exists and is writable: $LOG_FILE" "$LINENO"
+    fi
+}
+
+# Function: Log the log file to the screen
+show_log() {
+    if [ -f "$LOG_FILE" ]; then
+        cat "$LOG_FILE"
+    else
+        log_message "INFO" "Log file not found: $LOG_FILE" "$LINENO"
+    fi
+    exit 0
+}
+
+# ==============================
+# Cache Management Functions
+# ==============================
+
+# Function: Check if a directory is a mount point
+is_mount_point() {
+    local dir="$1"
+
+    if [[ "$OSTYPE" == "linux"* ]]; then
+        # Use `findmnt` if available on Linux
+        if command -v findmnt >/dev/null 2>&1; then
+            findmnt -n -o TARGET --target "$dir" >/dev/null 2>&1
+            return $?
+        fi
+    elif [[ "$OSTYPE" == "darwin"* ]]; then
+        # macOS: Use `df` to check if the directory is a separate mount
+        if [[ $(df "$dir" 2>/dev/null | tail -n +2 | awk '{print $NF}') == "$dir" ]]; then
+            return 0
+        fi
+    elif [[ "$OSTYPE" == "msys" || "$OSTYPE" == "cygwin" ]]; then
+        # Windows: Skip mount point check as it's less relevant for typical use cases
+        return 1
+    fi
+
+    # Default: Assume it's not a mount point
+    return 1
+}
+
+# Function: Check if a directory is critical
+is_critical_directory() {
+    local dir="$1"
+    local critical_dirs=(
+        "/" "/home" "/bin" "/boot" "/dev" "/etc" "/lib" "/lib64" "/proc" "/root" "/sbin" "/sys" "/usr" "/var" "/tmp"
+        "C:\\" "C:\\Windows" "C:\\Program Files" "C:\\Program Files (x86)" "C:\\Users" "C:\\Documents and Settings"
+    )
+
+    # Check if the directory is in the list of critical directories
+    for critical_dir in "${critical_dirs[@]}"; do
+        if [[ "$dir" == "$critical_dir" ]]; then
+            return 0 # true: critical directory
+        fi
+    done
+
+    # Protect symbolic links
+    if [[ -L "$dir" ]]; then
+        return 0 # true: critical directory
+    fi
+
+    # Check if the directory is a mount point (cross-platform)
+    if is_mount_point "$dir"; then
+        return 0 # true: critical directory
+    fi
+
+    return 1 # false: not a critical directory
+}
+
+# Function: Delete all cached files
+delete_cache() {
+    log_message "INFO" "Deleting all cached files..." "$LINENO"
+
+    # Ensure CACHE_DIR is defined and not empty
+    if [[ -z "$CACHE_DIR" ]]; then
+        log_message "FATAL" "CACHE_DIR is not set. Unable to proceed." "$LINENO"
+        exit 1
+    fi
+
+    # Ensure CACHE_DIR exists
+    if [[ ! -d "$CACHE_DIR" ]]; then
+        log_message "FATAL" "Cache directory '$CACHE_DIR' does not exist." "$LINENO"
+        exit 1
+    fi
+
+    # Prevent deletion of critical directories
+    if is_critical_directory "$CACHE_DIR"; then
+        log_message "FATAL" "Attempted to delete a critical directory '$CACHE_DIR'. Aborting." "$LINENO"
+        exit 1
+    fi
+
+    # Attempt to delete the cache directory
+    if rm -rf "$CACHE_DIR"; then
+        log_message "INFO" "Success: All cached files in '$CACHE_DIR' deleted." "$LINENO"
+        exit 0
+    else
+        log_message "FATAL" "Failed to delete cached files in '$CACHE_DIR'." "$LINENO"
+        exit 1
+    fi
+}
+
+# Function: Initialize the cache directory
+init_cache() {
+    # Create the master cache directory and log file if they don't exist
+    if [ ! -d "$CACHE_DIR" ]; then
+        mkdir -p "$CACHE_DIR"
+        log_message "DEBUG" "Created cache directory: $CACHE_DIR" "$LINENO"
+    else
+        log_message "DEBUG" "Cache directory already exists: $CACHE_DIR" "$LINENO"
+    fi
+}
+
+# ==============================
+# Notification Functions
+# ==============================
+
+# Function: Send desktop notifications
+send_desktop_notification() {
+    local title="$1"
+    local message="$2"
+
+    if [ "$DESKTOP_NOTIFICATION" = true ]; then
+        if [[ "$OSTYPE" == "darwin"* ]]; then
+            if ! osascript -e "display notification \"$message\" with title \"$title\""; then
+                log_message "ERROR" "Failed to send notification on macOS." "$LINENO"
+            fi
+        elif [[ "$OSTYPE" == "linux"* ]]; then
+            if command -v notify-send &>/dev/null; then
+                notify-send "$title" "$message"
+            else
+                log_message "ERROR" "notify-send is not installed. Install it to enable notifications on Linux." "$LINENO"
+            fi
+        elif [[ "$OSTYPE" == "cygwin" || "$OSTYPE" == "msys" || "$OSTYPE" == "win32" ]]; then
+            if ! powershell -Command "[System.Windows.Forms.MessageBox]::Show('$message', '$title')"; then
+                log_message "ERROR" "Failed to send notification on Windows." "$LINENO"
+            fi
+        else
+            log_message "ERROR" "Desktop notifications are only supported on macOS, Linux, and Windows." "$LINENO"
+        fi
+    fi
+}
+
+# Function: Send Pushover notifications
+send_pushover_notification() {
+    local title=$1
+    local message=$2
+    local website_url=$3
+    local response
+
+    if [ "$PUSHOVER_NOTIFICATION" = true ]; then
+        log_message "DEBUG" "Processing Pushover notification: $website_url" "$LINENO"
+        log_message "DEBUG" "Url: $website_url" "$LINENO"
+        log_message "DEBUG" "Message: $message" "$LINENO"
+
+        # Check if PUSHOVER_API_TOKEN is set
+        if [[ -z "$PUSHOVER_API_TOKEN" ]]; then
+            log_message "ERROR" "Error: PUSHOVER_API_TOKEN is not set." "$LINENO"
+            return 1
+        fi
+
+        # Check if USER_KEY is set
+        if [[ -z "$PUSHOVER_USER_KEY" ]]; then
+            log_message "ERROR" "Error: PUSHOVER_USER_KEY is not set." "$LINENO"
+            return 1
+        fi
+
+        # Build the curl command
+        local curl_command="curl -s \
+            --form-string \"token=$PUSHOVER_API_TOKEN\" \
+            --form-string \"user=$PUSHOVER_USER_KEY\" \
+            --form-string \"title=$title\" \
+            --form-string \"message=$message\" \
+            --form \"priority=0\" \
+            https://api.pushover.net/1/messages.json"
+
+        # Add URL options if website_url is defined
+        if [[ -n "$website_url" ]]; then
+            curl_command+=" --form \"url=$website_url\" --form \"url_title=Visit Site\""
+        fi
+
+        # Execute the curl command
+        response=$(eval $curl_command)
+
+        if [[ $? -ne 0 || -z "$response" ]]; then
+            log_message "ERROR" "Failed to send Pushover notification for: $website_url" "$LINENO"
+            return 1
+        fi
+
+        # Extract the status from the JSON response
+        local status=$(echo "$response" | grep -o '"status":[0-9]*' | sed 's/"status"://')
+
+        # Check if status is 1 (success)
+        if [[ "$status" != "1" ]]; then
+            log_message "ERROR" "Pushover API returned an error: $response" "$LINENO"
+            return 1
+        fi
+
+        log_message "DEBUG" "Pushover notification sent successfully." "$LINENO"
+        return 0
+    fi
+}
+
+# ==============================
+# Process Execution Functions
+# ==============================
+
+# Function: Start the service
+start_service() {
+    # Set up the trap for cleanup on app exit
+    trap 'cleanup_pid' EXIT
+
+    log_message "INFO" "Starting $APP_NAME service..." "$LINENO"
+
+    # Launch the service as a background process in a subshell
+    (
+        main >/dev/null 2>&1 &
+        local service_pid=$!
+
+        # Sleep briefly to ensure the background process has initialized
+        sleep 3
+
+        # Verify that the background process is running by checking the PID
+        if kill -0 "$service_pid" >/dev/null 2>&1; then
+            IS_SERVICE=true
+            # Write the PID to the file
+            echo "$service_pid" >"$PID_FILE"
+            log_message "DEBUG" "$APP_NAME service started with PID $service_pid." "$LINENO"
+        else
+            # If the process failed to start, clean up and exit
+            log_message "FATAL" "Failed to start $APP_NAME service. PID is not valid." "$LINENO"
+            cleanup_pid
+            exit 1
+        fi
+    ) &
+
+    # The service is now running in the background
+    log_message "INFO" "$APP_NAME service is running in the background." "$LINENO"
+}
+
+# Function: Stop the service
+stop_service() {
+    if [[ ! -f "$PID_FILE" ]]; then
+        log_message "INFO" "No $APP_NAME service is currently running." "$LINENO"
+        exit 0
+    fi
+
+    local pid
+    pid=$(cat "$PID_FILE")
+    if kill -0 "$pid" >/dev/null 2>&1; then
+        log_message "INFO" "Stopping $APP_NAME service with PID $pid..." "$LINENO"
+        kill "$pid"
+        cleanup_pid
+        log_message "INFO" "$APP_NAME service stopped." "$LINENO"
+    else
+        log_message "WARN" "No active $APP_NAME process found for PID $pid. Cleaning up stale PID file." "$LINENO"
+        cleanup_pid
+    fi
+}
+
+# Function: Restart the service
+restart_service() {
+    if [[ ! -f "$PID_FILE" ]]; then
+        log_message "INFO" "No $APP_NAME service is currently running." "$LINENO"
+        exit 0
+    fi
+
+    log_message "INFO" "Restarting $APP_NAME service with PID $pid..." "$LINENO"
+    stop_service
+    start_service
+}
+
+# Function: Check the status of the service
+status_service() {
+    if [[ -f "$PID_FILE" ]]; then
+        local pid
+        pid=$(cat "$PID_FILE")
+        if kill -0 "$pid" >/dev/null 2>&1; then
+            log_message "INFO" "$APP_NAME service is running with PID $pid." "$LINENO"
+        else
+            log_message "WARN" "$APP_NAME service is not running, but PID file exists. Cleaning up stale PID file." "$LINENO"
+            cleanup_pid
+        fi
+    else
+        log_message "INFO" "$APP_NAME service is not running." "$LINENO"
+    fi
+}
+
+# Function: Prevent running multiple interactive instances (except for specific cases)
+check_already_running() {
+    if [[ -f "$PID_FILE" ]]; then
+        local pid
+        pid=$(cat "$PID_FILE")
+        if kill -0 "$pid" >/dev/null 2>&1; then
+            log_message "ERROR" "Another instance of the $APP_NAME is already running (PID: $pid)." "$LINENO"
+            exit 1
+        else
+            log_message "WARN" "Stale $APP_NAME PID file found. Cleaning up." "$LINENO"
+            rm -f "$PID_FILE"
+        fi
+    fi
+}
+
+# Function: Cleanup PID file on exit
+cleanup_pid() {
+    # Ensure the PID file exists before attempting to clean it up
+    if [[ -f "$PID_FILE" ]]; then
+        log_message "DEBUG" "Cleaning up $APP_NAME PID file and exiting." "$LINENO"
+        rm -f "$PID_FILE"
+    fi
+}
+
+# Function: Run the check
+start_process() {
+    # Handle status or stop service before checking for running instances
+    if [[ "$SHOW_STATUS" == true ]]; then
+        status_service
+        exit 0
+    fi
+
+    if [[ "$STOP_SERVICE" == true ]]; then
+        stop_service
+        exit 0
+    fi
+
+    # Check if an instance is already running
+    if [[ "$RESTART_SERVICE" == true ]]; then
+        restart_service
+    else
+        check_already_running
+
+        # Log and start the configuration
+        log_message "INFO" "Starting $APP_NAME: $(date)" "$LINENO"
+        show_config
+
+        # Start the service or run interactively
+        if [[ "$START_SERVICE" == true ]]; then
+            start_service
+        else
+            log_message "INFO" "Running $APP_NAME interactively..." "$LINENO"
+            # Set up a trap for cleanup on termination
+            trap 'cleanup_pid' EXIT
+            echo $$ >"$PID_FILE"
+            main
+        fi
+    fi
+}
+
+# ==============================
+# Configuration and Initialization Functions
+# ==============================
+
+# Function: Load configuration from JSON file
+load_config() {
+    local config_file_path="$1"
+    if [[ ! -f "$config_file_path" ]]; then
+        log_message "FATAL" "Configuration file not found: $config_file_path" "$LINENO"
+        exit 1
+    fi
+
+    # Use jq to parse the JSON and set environment variables
+    local jq_output
+    jq_output=$(jq -r '.configuration | to_entries | .[] | "\(.key)=\(.value)"' "$config_file_path")
+    log_message "DEBUG" "Configuration file settings: $jq_output" "$LINENO"
+
+    while IFS="=" read -r key value; do
+        # Skip empty lines, invalid entries, or keys that are in the skip_keys array
+        if [[ -n "$key" && -n "$value" && ! " ${SKIP_CONFIG_KEYS[@]} " =~ " ${key} " ]]; then
+            [[ "$key" == *_DIR || "$key" == *_FILE || "$key" == *_CMD ]] && value="$(normalize_path "$value")"
+            export "$key"="$value"
+            log_message "DEBUG" "Setting $key=$value" "$LINENO"
+        fi
+    done <<<"$jq_output"
+}
+
+# Function: Get all "connections" groups and return them in an array
+get_connection_groups() {
+    local config_file_path="$1"
+    jq -r '.connections | keys | sort[]' "$config_file_path"
+}
+
+# Function: Get connection settings as key-value pairs
+get_connection_settings() {
+    local group="$1"
+    local index="$2"
+    local config_file_path="$3"
+    local -n result_array=$4
+
+    while IFS="=" read -r key value; do
+        result_array["$key"]="$value"
+        log_message "DEBUG" "Connection settings: $key=$value" "$LINENO"
+    done < <(jq -r ".connections[\"$group\"][$index] | to_entries | map(\"\\(.key)=\\(.value)\") | .[]" "$config_file_path")
+}
+
+# Function: Show configuration file
+show_config_file() {
+    log_message "INFO" "Configuration file: $CONFIG_FILE" "$LINENO"
+    log_message "INFO" "" "$LINENO"
+    if [ -f "$CONFIG_FILE" ]; then
+        cat "$CONFIG_FILE"
+    else
+        log_message "ERROR" "Configuration file not found: $CONFIG_FILE" "$LINENO"
+    fi
+    log_message "INFO" "" "$LINENO"
+    exit 0
+}
+
+# Function: Initialize the configuration file
+init_config() {
+    # Ensure the directory for the configuration file exists
+    config_dir=$(dirname "$CONFIG_FILE")
+    if [ ! -d "$config_dir" ]; then
+        printf "Configuration file directory %s does not exist. Creating it...\n" "$config_dir"
+        mkdir -p "$config_dir" || {
+            log_message "FATAL" "Failed to create directory: $config_dir" "$LINENO"
+            exit 1
+        }
+    fi
+
+    # Check if the configuration file already exists
+    if [ -f "$CONFIG_FILE" ]; then
+        if [ "$INIT_FORCE" = true ]; then
+            printf "FORCE is true. Replacing the existing configuration file...\n"
+        else
+            read -p "Configuration file $CONFIG_FILE already exists. Do you want to replace it? (y/n): " choice
+            case "$choice" in
+            y | Y)
+                printf "Replacing the existing configuration file...\n"
+                ;;
+            n | N)
+                printf "Keeping the existing configuration file.\n"
+                return
+                ;;
+            *)
+                printf "Invalid choice. Keeping the existing configuration file.\n"
+                return
+                ;;
+            esac
+        fi
+    fi
+
+    # Create the configuration content
+    config_content=$(
+        cat <<EOF
+{
+    "configuration": {
+        "CACHE_DIR": "$CACHE_DIR",
+        "LOG_FILE": "$LOG_FILE",
+        "CHECK_INTERVAL": "$CHECK_INTERVAL",
+        "TIMEOUT": "$TIMEOUT",
+        "SYSTEM_NAME": "$SYSTEM_NAME",
+        "PUSHOVER_NOTIFICATION": "$PUSHOVER_NOTIFICATION",
+        "PUSHOVER_USER_KEY": "$PUSHOVER_USER_KEY",
+        "PUSHOVER_API_TOKEN": "$PUSHOVER_API_TOKEN",
+        "DESKTOP_NOTIFICATION": "$DESKTOP_NOTIFICATION",
+        "VERBOSE": "$VERBOSE",
+        "LOG_LEVEL": "$LOG_LEVEL"
+    },
+    "connections": {
+        "default": [
+            {
+                "NAME": "Ping Test",
+                "TYPE": "PING",
+                "HOST": "1.1.1.1",
+                "TIMEOUT": "5s",
+                "PASS_CMD": "",
+                "FAIL_CMD": "",
+                "RECOVERED_CMD": "",
+                "UNKNOWN_CMD": ""
+            },
+            {
+                "NAME": "HTTP/S Test",
+                "TYPE": "HTTP",
+                "URL": "www.google.com",
+                "TIMEOUT": "5s",
+                "PASS_CMD": "",
+                "FAIL_CMD": "",
+                "RECOVERED_CMD": "",
+                "UNKNOWN_CMD": ""
+            },
+            {
+                "NAME": "Cert Expiry",
+                "TYPE": "CERT",
+                "DOMAIN": "google.com",
+                "EXPIRY_DAYS": "30d",
+                "TIMEOUT": "30s",
+                "CHECK_FREQUENCY": "30d"
+            },
+            {
+                "NAME": "Domain Expiry",
+                "TYPE": "DOMAIN",
+                "DOMAIN": "google.com",
+                "EXPIRY_DAYS": "365d",
+                "TIMEOUT": "5",
+                "CHECK_FREQUENCY": "60d"
+            }
+        ]
+    }
+}
+EOF
+    )
+
+    # Write the configuration content to the file
+    if ! echo "$config_content" >"$CONFIG_FILE"; then
+        log_message "FATAL" "Failed to create configuration file at $CONFIG_FILE" "$LINENO"
+        exit 1
+    fi
+
+    log_message "INFO" "Default configuration file created at $CONFIG_FILE" "$LINENO"
+    exit 0
+}
+
+# Function: Show configuration information
+show_config() {
+    log_message "INFO" "Configuration file: $CONFIG_FILE" "$LINENO"
+    log_message "INFO" "Cache directory: $CACHE_DIR" "$LINENO"
+    log_message "INFO" "Log file: $LOG_FILE" "$LINENO"
+    log_message "INFO" "PID file: $PID_FILE" "$LINENO"
+    log_message "INFO" "Log Level: $LOG_LEVEL" "$LINENO"
+    log_message "INFO" "Verbose enabled: $VERBOSE" "$LINENO"
+    log_message "INFO" "System Name: $SYSTEM_NAME" "$LINENO"
+    log_message "INFO" "Pushover enabled: $PUSHOVER_NOTIFICATION" "$LINENO"
+    log_message "INFO" "Desktop notification enabled: $DESKTOP_NOTIFICATION" "$LINENO"
+    log_message "INFO" "Check interval: $CHECK_INTERVAL" "$LINENO"
+    log_message "INFO" "Timeout interval: $TIMEOUT" "$LINENO"
+    log_message "INFO" "Repeat times: ${REPEAT:-0}" "$LINENO"
+}
+
+# ==============================
+# Help Functions
+# ==============================
+
+# Function: Show help message
+show_help() {
+    printf "Usage: %s [options]\n" "$(basename "$0")"
+
+    # General Options
+    printf "\nGeneral Options:\n"
+    printf "  -h, --help                  Display this help message.\n"
+    printf "  -V, --version               Display the application version.\n"
+
+    # Configuration and Initialization
+    printf "\nConfiguration and Initialization:\n"
+    printf "  -c, --config <config_file>  Specify a custom configuration file (default: %s).\n" "${CONFIG_FILE}"
+    printf "  -i, --init                  Initialize the configuration file.\n"
+    printf "  -f, --force-init            Force initialize of the configuration file if one exists.\n"
+    printf "  -S, --show-config           Show the configuration settings.\n"
+    printf "  -e, --show-config-file      Show the configuration file.\n"
+    printf "  -E, --edit-config           Edit the configuration file.\n"
+
+    # Cache Management
+    printf "\nCache Management:\n"
+    printf "  -x, --clean                 Delete all cached files.\n"
+    printf "  -C, --cache-dir  <path>     Specify a custom cache directory (default: %s).\n" "${CACHE_DIR}"
+
+    # Notification Options
+    printf "\nNotification Options:\n"
+    printf "  -n, --system-name           Name of the system running the script (default: %s).\n" "${SYSTEM_NAME}"
+    printf "  -p, --pushover              Send Pushover notifications.\n"
+    printf "  -u, --user-key <key>        Specify the user key for Pushover notifications.\n"
+    printf "  -a, --api-token <token>     Specify the API token for Pushover notifications.\n"
+    printf "  -d, --desktop               Send desktop notifications using AppleScript.\n"
+
+    # Logging and Output
+    printf "\nLogging and Output:\n"
+    printf "  -v, --verbose               Enable verbose output.\n"
+    printf "  -l, --log                   Log the log file to the screen.\n"
+    printf "  -o, --output <file>         Specify a custom log file location (default: %s).\n" "${LOG_FILE}"
+    printf "  -L, --log-level <level>     Set the log level (FATAL, ERROR, WARN, INFO, DEBUG).\n"
+
+    # Remote Connection Configuration
+    printf "\nRemote Connection Configuration:\n"
+    printf "  -I, --interval <s,m,h,d>    Set the interval between checks (default: %s).\n" "${CHECK_INTERVAL}"
+    printf "  -T, --timeout <s,m,h,d>     Set the connection timeout for remote connections (default: %s).\n" "${TIMEOUT}"
+    printf "  -N, --repeat <number>       Repeat the checks in interactive mode N number of times and exit (default: %s).\n" "${REPEAT:-0}"
+    printf "  -Z, --list-connections      List the current status of all remote connections.\n"
+    printf "  -H, --history               Output a history of the connections to the screen.\n"
+    printf "  -F, --force                 Ignore the check frequency and check all connections.\n"
+
+    # Process Management Functions
+    printf "\nProcess Management:\n"
+    printf "  -s, --start                 Start the %s service in the background.\n" "${APP_NAME}"
+    printf "  -k, --stop                  Stop the %s service.\n" "${APP_NAME}"
+    printf "  -r, --restart               Restart the %s service.\n" "${APP_NAME}"
+    printf "  -t, --status                Check the current status of the %s service.\n" "${APP_NAME}"
+
+    # Examples
+    printf "\nExamples:\n"
+    printf "  Run interactively with default settings:\n"
+    printf "    %s\n" "$(basename "$0")"
+    printf "\n"
+    printf "  Start the service with default settings:\n"
+    printf "    %s --start\n" "$(basename "$0")"
+    printf "\n"
+    printf "  Restart the service with default settings:\n"
+    printf "    %s --restart\n" "$(basename "$0")"
+    printf "\n"
+    printf "  Check service status:\n"
+    printf "    %s --status\n" "$(basename "$0")"
+    printf "\n"
+    printf "  Stop the service:\n"
+    printf "    %s --stop\n" "$(basename "$0")"
+    printf "\n"
+}
+
+# ==============================
+# Argument Processing Functions
+# ==============================
+
+# Function: Parse command-line arguments and setup environment
+parse_cli_options() {
+
+    # Default configuration file locations
+    CONFIG_FILE="$(get_config_path "$CONFIG_FILE_NAME")"
+    CACHE_DIR="$(get_temp_path "$CACHE_DIR")"
+    LOG_FILE="$(normalize_path "$CACHE_DIR/$LOG_FILE_NAME")"
+
+    # Set default hostname
+    SYSTEM_NAME="$(get_hostname)"
+
+    # Process high priority items first
+    [[ " $@ " =~ " --help " || " $@ " =~ " -h " ]] && show_help && show_version && exit 0
+    [[ " $@ " =~ " --version " || " $@ " =~ " -V " ]] && show_version && exit 0
+
+    # Check for log level and verbose and process so they are available early
+    if [[ " $@ " =~ " --log-level " || " $@ " =~ " -L " ]]; then
+        for ((i = 1; i <= $#; i++)); do
+            case "${!i}" in
+            --log-level | -L)
+                next=$((i + 1))
+                if [[ -z "${!next}" || "${!next}" == -* ]]; then
+                    printf "Error: %s requires a value\n" "${!i}" >&2
+                    exit 1
+                fi
+                # Check if the log level exists in the LOG_LEVELS_MAP array
+                if [[ -n "${LOG_LEVELS_MAP[${!next}]}" ]]; then
+                    LOG_LEVEL="${!next}"
+                    SKIP_CONFIG_KEYS+=("LOG_LEVEL")
+                else
+                    printf "Error: %s requires a valid value. Available levels are: %s\n" "${!i}" "${!LOG_LEVELS_MAP[*]}" >&2
+                    exit 1
+                fi
+                # Remove the processed options from the arguments list
+                set -- "${@:1:$((i - 1))}" "${@:((i + 2))}"
+                i=$((i - 1))
+                ;;
+            --verbose | -v)
+                VERBOSE=true
+                SKIP_CONFIG_KEYS+=("VERBOSE")
+                # Remove the processed options from the arguments list
+                set -- "${@:1:$((i - 1))}" "${@:((i + 1))}"
+                i=$((i - 1))
+                ;;
+            esac
+        done
+    fi
+
+    # Process remaining options
+    local options_processed=false
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+        # Configuration and Initialization
+        --config | -c)
+            if [[ -z "$2" || "$2" == -* ]]; then
+                printf "Error: %s requires a value\n" "$1" >&2
+                exit 1
+            fi
+            CONFIG_FILE="$(normalize_path "$2")"
+            SKIP_CONFIG_KEYS+=("CONFIG_FILE")
+            shift 2
+            ;;
+        --init | -i)
+            INIT=true
+            shift
+            ;;
+        --force-init | -f)
+            INIT_FORCE=true
+            shift
+            ;;
+        --show-config | -S)
+            SHOW_CONFIG=true
+            shift
+            ;;
+        --show-config-file | -e)
+            SHOW_CONFIG_FILE=true
+            shift
+            ;;
+        --edit-config | -E)
+            EDIT_CONFIG_FILE=true
+            shift
+            ;;
+
+        # Cache Management
+        --clean | -x)
+            CLEAN=true
+            shift
+            ;;
+        --cache-dir | -C)
+            if [[ -z "$2" || "$2" == -* ]]; then
+                printf "Error: %s requires a value\n" "$1" >&2
+                exit 1
+            fi
+            CACHE_DIR="$(normalize_path "$2")"
+            LOG_FILE="$(normalize_path "$2/$LOG_FILE_NAME")"
+            SKIP_CONFIG_KEYS+=("CACHE_DIR")
+            shift 2
+            ;;
+
+        # Notification Options
+        --system-name | -n)
+            if [[ -z "$2" || "$2" == -* ]]; then
+                printf "Error: %s requires a value\n" "$1" >&2
+                exit 1
+            fi
+            SYSTEM_NAME="$2"
+            SKIP_CONFIG_KEYS+=("SYSTEM_NAME")
+            shift 2
+            ;;
+        --pushover | -p)
+            PUSHOVER_NOTIFICATION=true
+            SKIP_CONFIG_KEYS+=("PUSHOVER_NOTIFICATION")
+            shift
+            ;;
+        --user-key | -u)
+            if [[ -z "$2" || "$2" == -* ]]; then
+                printf "Error: %s requires a value\n" "$1" >&2
+                exit 1
+            fi
+            PUSHOVER_USER_KEY="$2"
+            SKIP_CONFIG_KEYS+=("PUSHOVER_USER_KEY")
+            shift 2
+            ;;
+        --api-token | -a)
+            if [[ -z "$2" || "$2" == -* ]]; then
+                printf "Error: %s requires a value\n" "$1" >&2
+                exit 1
+            fi
+            PUSHOVER_API_TOKEN="$2"
+            SKIP_CONFIG_KEYS+=("PUSHOVER_API_TOKEN")
+            shift 2
+            ;;
+        --desktop | -d)
+            DESKTOP_NOTIFICATION=true
+            SKIP_CONFIG_KEYS+=("DESKTOP_NOTIFICATION")
+            shift
+            ;;
+
+        # Logging and Output
+        --log | -l)
+            SHOW_LOG=true
+            shift
+            ;;
+        --output | -o)
+            if [[ -z "$2" || "$2" == -* ]]; then
+                printf "Error: %s requires a value\n" "$1" >&2
+                exit 1
+            fi
+            LOG_FILE="$(normalize_path "$2")"
+            SKIP_CONFIG_KEYS+=("LOG_FILE")
+            shift 2
+            ;;
+
+        # Remote Connection Configuration
+        --interval | -I)
+            if [[ -z "$2" || "$2" == -* ]]; then
+                printf "Error: %s requires a value\n" "$1" >&2
+                exit 1
+            fi
+            CHECK_INTERVAL="$2"
+            SKIP_CONFIG_KEYS+=("CHECK_INTERVAL")
+            shift 2
+            ;;
+        --timeout | -T)
+            if [[ -z "$2" || "$2" == -* ]]; then
+                printf "Error: %s requires a value\n" "$1" >&2
+                exit 1
+            fi
+            TIMEOUT="$2"
+            SKIP_CONFIG_KEYS+=("TIMEOUT")
+            shift 2
+            ;;
+        --repeat | -N)
+            if [[ -z "$2" || "$2" == -* ]]; then
+                printf "Error: %s requires a value\n" "$1" >&2
+                exit 1
+            fi
+            if ! [[ "$2" =~ ^[0-9]+$ ]]; then
+                printf "Error: Timeout must be an integer\n" >&2
+                exit 1
+            fi
+            REPEAT="$2"
+            SKIP_CONFIG_KEYS+=("REPEAT")
+            shift 2
+            ;;
+        --list-connections | -Z)
+            LIST_CONNECTIONS=true
+            shift
+            ;;
+        --history | -H)
+            HISTORY=true
+            shift
+            ;;
+        --force | -F)
+            FORCE=true
+            shift
+            ;;
+
+        # Process Management
+        --start | -s)
+            START_SERVICE=true
+            shift
+            ;;
+        --stop | -k)
+            STOP_SERVICE=true
+            shift
+            ;;
+        --restart | -r)
+            RESTART_SERVICE=true
+            shift
+            ;;
+        --status | -t)
+            SHOW_STATUS=true
+            shift
+            ;;
+
+        # End of Options
+        --)
+            options_processed=true
+            shift
+            break
+            ;;
+
+        # All remaining input is invalid
+        -*)
+            printf "Error: Unknown option: %s\n" "$1" >&2
+            exit 1
+            ;;
+        *)
+            printf "Error: Invalid input: %s\n" "$1" >&2
+            exit 1
+            ;;
+        esac
+    done
+
+    # Check for cache critical path
+    if is_critical_directory "$CACHE_DIR"; then
+        log_message "FATAL" "Attempted to set cache path to a critical directory '$CACHE_DIR'. Aborting." "$LINENO"
+        exit 1
+    fi
+
+    # Delete the cache directory and exit
+    [[ "$CLEAN" = true ]] && delete_cache
+
+    # Initialize the default configuration file and exit
+    [[ -z "$INIT" || "$INIT" = false ]] && load_config "$CONFIG_FILE"
+    [[ "$INIT" = true ]] && init_config
+    init_cache
+    init_log
+
+    # Set the PID file based on final CACHE_DIR
+    PID_FILE="$(normalize_path "$CACHE_DIR/$PID_FILE_NAME")"
+
+    # Run a final processing of arguments
+    process_arguments
+}
+
+# Function: Process and execute actions based on parsed arguments
+process_arguments() {
+    [[ "$LIST_CONNECTIONS" = true || "$HISTORY" = true ]] && list_connection_states
+    [[ "$EDIT_CONFIG_FILE" = true ]] && edit_file "$CONFIG_FILE"
+    [[ "$SHOW_LOG" = true ]] && show_log
+    [[ "$SHOW_CONFIG_FILE" = true ]] && show_config_file
+    [[ "$SHOW_CONFIG" = true ]] && show_config && show_version && exit
+}
+
+# ==============================
+# Connection State Functions
+# ==============================
+
+# Function: Create log directories
+create_log_directories() {
+    local group="$(normalize_filename "$1")"
+    local group_dir="$(normalize_path "$CACHE_DIR/$group")"
+
+    # Debugging: Log the directory creation attempt
+    log_message "DEBUG" "Attempting to create log directory: $group_dir" "$LINENO"
+
+    # Check if the directory already exists
+    if [[ ! -d "$group_dir" ]]; then
+        # Create the directory and handle errors
+        if mkdir -p "$group_dir"; then
+            log_message "INFO" "Successfully created log directory: $group_dir" "$LINENO"
+        else
+            log_message "ERROR" "Failed to create log directory: $group_dir" "$LINENO"
+            return 1
+        fi
+    fi
+}
+
+# Function: Log connection status in CSV
+log_status_csv() {
+    local group="$(normalize_filename "$1")"
+    local connection_name="$(normalize_filename "$2")"
+    local status="$3"
+    local timestamp=$(date -u "+%Y-%m-%dT%H:%M:%SZ")
+    local log_file="$(normalize_path "$CACHE_DIR/$group/${connection_name}.csv")"
+
+    # Debugging: Log the attempt to write to the log file
+    log_message "DEBUG" "Attempting to write to log file: $log_file" "$LINENO"
+
+    # Write to the log file and handle errors
+    if echo "$timestamp,$status" >>"$log_file"; then
+        log_message "DEBUG" "Successfully logged status to: $log_file" "$LINENO"
+    else
+        log_message "ERROR" "Failed to write to log file: $log_file" "$LINENO"
+        return 1
+    fi
+}
+
+# Function: Show the latest connection state
+show_latest_state_csv() {
+    local group="$(normalize_filename "$1")"
+    local connection_name="$2"
+    local connection_name_normalized="$(normalize_filename "$connection_name")"
+    local log_file="$(normalize_path "$CACHE_DIR/$group/${connection_name_normalized}.csv")"
+
+    # Debugging: Log the attempt to read the log file
+    log_message "DEBUG" "Attempting to read log file: $log_file" "$LINENO"
+
+    # Check if the log file exists
+    if [[ -f "$log_file" ]]; then
+        # Determine the latest status and date checked
+        local latest_entry=$(awk -F, 'END {print $0}' "$log_file")
+        local latest_date=$(echo "$latest_entry" | awk -F, '{print $1}')
+        local latest_status=$(echo "$latest_entry" | awk -F, '{print $2}')
+
+        # Set the color based on the latest status
+        local color
+        local text_color
+        case "$latest_status" in
+        "PASS")
+            color="$GREEN_BG"
+            text_color="$GREEN"
+            ;;
+        "FAIL")
+            color="$RED_BG"
+            text_color="$RED"
+            ;;
+        "RECOVERED")
+            color="$YELLOW_BG"
+            text_color="$YELLOW"
+            ;;
+        "UNKNOWN")
+            color="$ORANGE_BG"
+            text_color="$ORANGE"
+            ;;
+        *)
+            color="$NC"
+            text_color="$NC"
+            ;;
+        esac
+
+        # Display the latest status with color-coded background and human-readable date
+        printf "  ${text_color}${color}%s${NC} %s\n" " $latest_status " "$connection_name"
+
+        log_message "DEBUG" "Successfully retrieved latest status for log file: $log_file" "$LINENO"
+    else
+        log_message "ERROR" "Log file not found: $log_file" "$LINENO"
+        return 1
+    fi
+}
+
+# Function: Show the statistical history of connection states
+show_history_state_csv() {
+    local group="$(normalize_filename "$1")"
+    local connection_name="$2"
+    local connection_name_normalized="$(normalize_filename "$connection_name")"
+    local log_file="$(normalize_path "$CACHE_DIR/$group/${connection_name_normalized}.csv")"
+
+    # Debugging: Log the attempt to read the log file
+    log_message "DEBUG" "Attempting to read log file: $log_file" "$LINENO"
+
+    # Check if the log file exists
+    if [[ -f "$log_file" ]]; then
+        # Read the log file and calculate statistics
+        local total_checks=$(awk -F, 'END {print NR}' "$log_file")
+        local up_count=$(awk -F, '$2 == "PASS" {count++} END {print count+0}' "$log_file")
+        local down_count=$(awk -F, '$2 == "FAIL" {count++} END {print count+0}' "$log_file")
+        local resumed_count=$(awk -F, '$2 == "RECOVERED" {count++} END {print count+0}' "$log_file")
+
+        # Determine the latest status and date checked
+        local latest_entry=$(awk -F, 'END {print $0}' "$log_file")
+        local latest_date=$(echo "$latest_entry" | awk -F, '{print $1}')
+        local latest_status=$(echo "$latest_entry" | awk -F, '{print $2}')
+
+        # Display the statistics in a single line with the current state
+        printf "  %s | Total Checks: %d | Up: %d | Down: %d | Resumed: %d | Current State: %s\n" \
+            "$connection_name" "$total_checks" "$up_count" "$down_count" "$resumed_count" "$latest_status"
+
+        log_message "DEBUG" "Successfully calculated statistics for log file: $log_file" "$LINENO"
+    else
+        log_message "ERROR" "Log file not found: $log_file" "$LINENO"
+        return 1
+    fi
+}
+
+# Function: Show all connection state
+list_connection_states() {
+    # Get the connection groups
+    local groups=($(get_connection_groups "$CONFIG_FILE"))
+
+    # Check if groups array is empty or null
+    if [[ ${#groups[@]} -eq 0 ]]; then
+        log_message "FATAL" "No connection groups found in the configuration file." "$LINENO"
+        exit 1
+    fi
+
+    # Process the remaining groups
+    for group in "${groups[@]}"; do
+        log_message "DEBUG" "Group: $group" "$LINENO"
+        printf "\nGroup: %s\n\n" "$group"
+        connections=$(jq -r ".connections[\"$group\"] | length" "$CONFIG_FILE")
+        for ((i = 0; i < connections; i++)); do
+            local -A connection_result
+            get_connection_settings "$group" "$i" "$CONFIG_FILE" connection_result
+            [[ "$LIST_CONNECTIONS" = true ]] && show_latest_state_csv "$group" "${connection_result["NAME"]}"
+            [[ "$HISTORY" = true ]] && show_history_state_csv "$group" "${connection_result["NAME"]}"
+        done
+    done
+
+    printf "\n"
+    exit 0
+}
+
+# Function: Get connections last status
+check_last_connection_state() {
+    local -n last_check_settings=$1
+    local group=${last_check_settings["GROUP"]}
+    local name=${last_check_settings["NAME"]}
+    local log_file="$CACHE_DIR/$(normalize_filename "$group")/$(normalize_filename "$name").csv"
+
+    if [[ -f "$log_file" ]]; then
+        local last_entry=$(awk -F, 'END {print $0}' "$log_file")
+        local last_status=$(echo "$last_entry" | awk -F, '{print $2}')
+    fi
+
+    echo "$last_status"
+}
+
+# ==============================
+# Network Test Functions
+# ==============================
+
+# Function: Test if a system is reachable (using ping)
+# Protocol: ICMP
+test_icmp_reachable() {
+    local -n test_settings=$1
+    local host=${test_settings["HOST"]}
+    local timeout=$(get_interval_in_seconds "${test_settings["TIMEOUT"]}")
+    local command
+
+    # Adjust command based on platform
+    if [[ "$(uname)" == "Darwin" ]]; then
+        # macOS/BSD: Use -t for TTL
+        command="ping -c 1 -t $timeout $host"
+    else
+        # Linux: Use -W for timeout in seconds
+        command="ping -c 1 -W $timeout $host"
+    fi
+
+    # Execute the command
+    if $command >/dev/null 2>&1; then
+        # Check the last connection state and update the status if necessary
+        local last_status=$(check_last_connection_state test_settings)
+        if [[ "$last_status" == "FAIL" || "$last_status" == "UNKNOWN" ]]; then
+            test_settings["MESSAGE_TITLE"]="Ping Recovered Alert"
+            test_settings["STATUS"]="RECOVERED"
+            test_settings["MESSAGE"]="${test_settings["HOST"]} has recovered."
+        else
+            test_settings["STATUS"]="PASS"
+            test_settings["MESSAGE"]="$host is reachable"
+        fi
+    else
+        test_settings["STATUS"]="FAIL"
+        test_settings["MESSAGE_TITLE"]="Ping Failure Alert"
+        test_settings["MESSAGE"]="$host is not reachable."
+    fi
+}
+
+# Function: Test if a website or web endpoint is reachable (using curl)
+# Protocol: HTTP/HTTPS
+function test_https_reachable() {
+    local -n test_settings=$1
+    local url=${test_settings["URL"]}
+    local port=${test_settings["PORT"]} # Optional port
+    local timeout=$(get_interval_in_seconds "${test_settings["TIMEOUT"]}")
+
+    # Adjust the URL to include the port if provided
+    if [[ -n $port ]]; then
+        url="${url}:${port}"
+    fi
+
+    # Perform the curl request, capture response headers (stdout), and verbose output (stderr)
+    # Capture headers into 'response_headers', suppressing the verbose output
+    local response_headers=$(curl -Is --connect-timeout "$timeout" -L "$url" 2>/dev/null)
+
+    # Log the response headers for debugging (optional)
+    # log_message "DEBUG" "Response headers: $response_headers" "$LINENO"
+
+    # Capture the status code from the first line of the response headers
+    local status_code=$(echo "$response_headers" | head -n 1 | awk '{print $2}' 2>/dev/null)
+
+    # Capture the Location header (if it's a redirect)
+    local location=$(echo "$response_headers" | grep -i "Location" | awk '{print $2}' 2>/dev/null)
+
+    if [[ -n $location ]]; then
+        log_message "WARN" "Redirecting to: $location " "$LINENO"
+    fi
+
+    # Check the status code and determine if the URL is reachable
+    if [[ $status_code -ge 200 && $status_code -lt 300 ]]; then
+        # Check the last connection state and update the status if necessary
+        local last_status=$(check_last_connection_state test_settings)
+        if [[ "$last_status" == "FAIL" || "$last_status" == "UNKNOWN" ]]; then
+            test_settings["MESSAGE_TITLE"]="HTTP/S Recovered Alert"
+            test_settings["STATUS"]="RECOVERED"
+            test_settings["MESSAGE"]="$url has has recovered with status code $status_code."
+        else
+            test_settings["STATUS"]="PASS"
+            test_settings["MESSAGE"]="$url is reachable with status code $status_code."
+        fi
+    else
+        test_settings["STATUS"]="FAIL"
+        test_settings["MESSAGE_TITLE"]="HTTP/S Failure Alert"
+        test_settings["MESSAGE"]="$url is not reachable, status code $status_code."
+        test_settings["MESSAGE_LINK"]="https://http.cat/$status_code"
+    fi
+}
+
+# Function: Check if a TCP:PORT is reachable (using Netcat)
+# Protocol: TCP(HOST:PORT)
+function test_tcp_reachable() {
+    local -n test_settings=$1
+    local host=${test_settings["HOST"]}
+    local port=${test_settings["PORT"]} # Optional port
+    local timeout=$(get_interval_in_seconds "${test_settings["TIMEOUT"]}")
+
+    if [[ "$OSTYPE" == "darwin"* ]]; then
+        # macOS
+        nc -zv -G $timeout $host $port >/dev/null 2>&1
+    else
+        # Linux and Windows (Git Bash)
+        nc -zv -w $timeout $host $port >/dev/null 2>&1
+    fi
+
+    if [ $? -eq 0 ]; then
+        # Check the last connection state and update the status if necessary
+        local last_status=$(check_last_connection_state test_settings)
+        if [[ "$last_status" == "FAIL" || "$last_status" == "UNKNOWN" ]]; then
+            test_settings["STATUS"]="RECOVERED"
+            test_settings["MESSAGE_TITLE"]="TCP Recovered Alert"
+            test_settings["MESSAGE"]="TCP has recovered on port $port on $host."
+        else
+            test_settings["STATUS"]="PASS"
+            test_settings["MESSAGE"]="TCP port $port on $host is open."
+        fi
+    else
+        test_settings["STATUS"]="FAIL"
+        test_settings["MESSAGE_TITLE"]="TCP Failure Alert"
+        test_settings["MESSAGE"]="TCP port $port on $host is closed."
+    fi
+}
+
+# Function: Test if a UDP connection is reachable (using Netcat)
+# Protocol: UDP
+function test_udp_reachable() {
+    local -n test_settings=$1
+    local host=${test_settings["HOST"]}
+    local port=${test_settings["PORT"]} # Optional port
+    local timeout=$(get_interval_in_seconds "${test_settings["TIMEOUT"]}")
+
+    # Attempt to send a UDP packet and check if the port is open
+    echo "Test UDP" | nc -v -u -w $timeout $host $port >/dev/null 2>&1
+
+    if [ $? -eq 0 ]; then
+        # Check the last connection state and update the status if necessary
+        local last_status=$(check_last_connection_state test_settings)
+        if [[ "$last_status" == "FAIL" || "$last_status" == "UNKNOWN" ]]; then
+            test_settings["MESSAGE_TITLE"]="UDP Recovered Alert"
+            test_settings["STATUS"]="RECOVERED"
+            test_settings["MESSAGE"]="UDP has recovered on port $port on $host."
+        else
+            test_settings["STATUS"]="PASS"
+            test_settings["MESSAGE"]="UDP port $port on $host is open."
+        fi
+    else
+        test_settings["STATUS"]="FAIL"
+        test_settings["MESSAGE_TITLE"]="UDP Failure Alert"
+        test_settings["MESSAGE"]="UDP port $port on $host is closed."
+    fi
+}
+
+# Function: Test if a domain name is about to expire (using Netcat)
+# Protocol: DOMAIN NAME EXPIRATION
+function test_domain_expiry() {
+    local -n test_settings=$1
+    local domain=${test_settings["DOMAIN"]}
+    local expiry_days=${test_settings["EXPIRY_DAYS"]}
+    local expiry_days_seconds=$(get_interval_in_seconds "$expiry_days")
+    local timeout=$(get_interval_in_seconds "${test_settings["TIMEOUT"]}")
+    local whois_host=${test_settings["WHOIS_HOST"]}
+
+    # If a WHOIS server is provided, use it; otherwise, rely on system's default WHOIS
+    local whois_data
+    if [ -n "$whois_host" ]; then
+        # If whois_host is set, use the specified WHOIS server with timeout
+        whois_data=$(timeout "$timeout" whois -h "$whois_host" "$domain" 2>/dev/null)
+    else
+        # If whois_host is not set, just use whois without specifying the server with timeout
+        whois_data=$(timeout "$timeout" whois "$domain" 2>/dev/null)
+    fi
+
+    # Check if the WHOIS data is empty
+    if [ -z "$whois_data" ]; then
+        test_settings["STATUS"]="UNKNOWN"
+        test_settings["MESSAGE_TITLE"]="Domain Expiry Alert"
+        test_settings["MESSAGE"]="Failed to fetch WHOIS data for $domain"
+        return 1
+    fi
+
+    # Extract expiry date
+    local expiry_date
+    expiry_date=$(echo "$whois_data" | grep -i -E 'Expiry Date|Registry Expiry Date|renewal date|Expires on' | head -n 1 | awk -F': ' '{print $NF}' | tr -d '\r')
+
+    if [ -z "$expiry_date" ]; then
+        test_settings["STATUS"]="UNKNOWN"
+        test_settings["MESSAGE_TITLE"]="Domain Expiry Alert"
+        test_settings["MESSAGE"]="Failed to fetch the expiry date for $domain"
+        return 1
+    fi
+
+    log_message "DEBUG" "Parsed expiry date for $domain: $expiry_date" "$LINENO"
+
+    # Convert the expiry date to a timestamp
+    local expiry_timestamp
+    if [[ "$OSTYPE" == "darwin"* ]]; then
+        expiry_timestamp=$(date -j -f "%Y-%m-%dT%H:%M:%SZ" "$expiry_date" +%s 2>/dev/null || date -j -f "%Y-%m-%d" "$expiry_date" +%s 2>/dev/null)
+    else
+        expiry_timestamp=$(date -d "$expiry_date" +%s 2>/dev/null || date -d "${expiry_date//T/ }" +%s 2>/dev/null)
+    fi
+
+    if [ $? -ne 0 ]; then
+        test_settings["STATUS"]="UNKNOWN"
+        test_settings["MESSAGE_TITLE"]="Domain Expiry Alert"
+        test_settings["MESSAGE"]="Failed to parse the expiry date for $domain"
+        return 1
+    fi
+
+    local current_timestamp=$(date +%s)
+    local diff=$((($expiry_timestamp - $current_timestamp) / 86400)) # convert to days
+    local diff_seconds=$((expiry_timestamp - current_timestamp))
+    log_message "DEBUG" "diff: $diff days, diff_seconds: $diff_seconds seconds, expiry_days: $expiry_days" "$LINENO"
+
+    if ((diff_seconds > expiry_days_seconds)); then
+        # Check the last connection state and update the status if necessary
+        local last_status=$(check_last_connection_state test_settings)
+        if [[ "$last_status" == "FAIL" || "$last_status" == "UNKNOWN" ]]; then
+            test_settings["MESSAGE_TITLE"]="Domain Expiry Alert"
+            test_settings["STATUS"]="RECOVERED"
+            test_settings["MESSAGE"]="The domain $domain has recovered and is valid for another $diff days"
+        else
+            test_settings["STATUS"]="PASS"
+            test_settings["MESSAGE"]="The domain $domain is valid for another $diff days"
+        fi
+    else
+        local message_link="https://www.whois.com/whois/$domain"
+        test_settings["STATUS"]="FAIL"
+        test_settings["MESSAGE_TITLE"]="Domain Expiry Alert"
+        test_settings["MESSAGE"]="The domain $domain will expire in $diff days"
+        test_settings["MESSAGE_LINK"]="$message_link"
+    fi
+}
+
+# Function: Test if a web certificate is about to expire (using openssl)
+# Protocol: CERT EXPIRATION
+function test_certificate_expiry() {
+    local -n test_settings=$1
+    local domain=${test_settings["DOMAIN"]}
+    local expiry_days=${test_settings["EXPIRY_DAYS"]}
+    local expiry_days_seconds=$(get_interval_in_seconds "$expiry_days")
+    local timeout=$(get_interval_in_seconds "${test_settings["TIMEOUT"]}")
+
+    # Fetch the certificate expiry date using openssl with timeout
+    local expiry_date=$(timeout "$timeout" openssl s_client -servername "$domain" -connect "$domain:443" 2>/dev/null | openssl x509 -noout -dates | grep "notAfter=" | cut -d= -f2)
+
+    # Check if the expiry_date is empty
+    if [ -z "$expiry_date" ]; then
+        test_settings["STATUS"]="UNKNOWN"
+        test_settings["MESSAGE_TITLE"]="Cert Expiry Alert"
+        test_settings["MESSAGE"]="Failed to fetch the certificate for $domain"
+        return 1
+    fi
+
+    # Convert the expiry date to a timestamp
+    local expiry_timestamp
+    if [[ "$OSTYPE" == "darwin"* ]]; then
+        # macOS
+        expiry_timestamp=$(date -j -f "%b %d %T %Y %Z" "$expiry_date" +%s 2>/dev/null)
+    else
+        # Linux and Windows (Git Bash)
+        expiry_timestamp=$(date -d "$expiry_date" +%s 2>/dev/null)
+    fi
+
+    if [ $? -ne 0 ] || [ -z "$expiry_timestamp" ]; then
+        test_settings["STATUS"]="UNKNOWN"
+        test_settings["MESSAGE_TITLE"]="Cert Expiry Alert"
+        test_settings["MESSAGE"]="Failed to parse the expiry date for $domain"
+        return 1
+    fi
+
+    local current_timestamp=$(date +%s)
+    local diff=$((($expiry_timestamp - $current_timestamp) / 86400)) # convert to days
+    local diff_seconds=$((expiry_timestamp - current_timestamp))
+    log_message "DEBUG" "diff: $diff days, diff_seconds: $diff_seconds seconds, expiry_days: $expiry_days" "$LINENO"
+
+    if ((diff_seconds > expiry_days_seconds)); then
+        # Check the last connection state and update the status if necessary
+        local last_status=$(check_last_connection_state test_settings)
+        if [[ "$last_status" == "FAIL" || "$last_status" == "UNKNOWN" ]]; then
+            test_settings["MESSAGE_TITLE"]="Cert Expiry Alert"
+            test_settings["STATUS"]="RECOVERED"
+            test_settings["MESSAGE"]="The certificate for $domain has recovered and will expire in $diff days"
+        else
+            test_settings["STATUS"]="PASS"
+            test_settings["MESSAGE"]="The certificate for $domain is valid for another $diff days"
+        fi
+    else
+        test_settings["STATUS"]="FAIL"
+        test_settings["MESSAGE_TITLE"]="Cert Expiry Alert"
+        test_settings["MESSAGE"]="The certificate for $domain will expire in $diff days"
+    fi
+}
+
+# ==============================
+# Application Functions
+# ==============================
+
+# Function: Process the connection results
+process_connection_results() {
+    local -n cmd_settings=$1
+    local group=${cmd_settings["GROUP"]}
+    local name=${cmd_settings["NAME"]}
+    local status=${cmd_settings["STATUS"]}
+    local timeout_duration=${cmd_settings["CMD_TIMEOUT"]:-10} # Default timeout of 10 seconds if not specified
+    local result
+    local status_cmd
+
+    # Check the last status
+    local last_status=$(check_last_connection_state cmd_settings)
+    cmd_settings["LAST_STATUS"]="$last_status" # Add last status so scripts can decide how to handle
+    log_status_csv "$group" "$name" "$status"
+
+    if [[ -n "$status" ]]; then
+        # Convert associative array to string
+        case "$status" in
+        "PASS")
+            log_message "DEBUG" "${cmd_settings["MESSAGE"]}" "$LINENO"
+            status_cmd=${cmd_settings["PASS_CMD"]}
+            ;;
+        "FAIL")
+            log_message "WARN" "${cmd_settings["MESSAGE"]}" "$LINENO"
+            status_cmd=${cmd_settings["FAIL_CMD"]}
+            # Skip sending notification if the last status is the same as the current status
+            if [[ "$last_status" != "$status" ]]; then
+                send_pushover_notification "${connection_result["MESSAGE_TITLE"]}" "${connection_result["MESSAGE"]}" "${connection_result["MESSAGE_LINK"]}"
+                send_desktop_notification "${connection_result["MESSAGE_TITLE"]}" "${connection_result["MESSAGE"]}"
+            fi
+            ;;
+        "RECOVERED")
+            log_message "WARN" "${cmd_settings["MESSAGE"]}" "$LINENO"
+            status_cmd=${cmd_settings["RECOVERED_CMD"]}
+            # Skip sending notification if the last status is the same as the current status
+            if [[ "$last_status" != "$status" ]]; then
+                send_pushover_notification "${connection_result["MESSAGE_TITLE"]}" "${connection_result["MESSAGE"]}" "${connection_result["MESSAGE_LINK"]}"
+                send_desktop_notification "${connection_result["MESSAGE_TITLE"]}" "${connection_result["MESSAGE"]}"
+            fi
+            ;;
+        "UNKNOWN")
+            log_message "ERROR" "${cmd_settings["MESSAGE"]}" "$LINENO"
+            status_cmd=${cmd_settings["UNKNOWN_CMD"]}
+            # Skip sending notification if the last status is the same as the current status
+            if [[ "$last_status" != "$status" ]]; then
+                send_pushover_notification "${connection_result["MESSAGE_TITLE"]}" "${connection_result["MESSAGE"]}" "${connection_result["MESSAGE_LINK"]}"
+                send_desktop_notification "${connection_result["MESSAGE_TITLE"]}" "${connection_result["MESSAGE"]}"
+            fi
+            ;;
+        esac
+
+        # run the configured status command
+        if [[ -n "$status_cmd" ]]; then
+            # Serialize the associative array into a string
+            local serialized_settings=""
+            for key in "${!cmd_settings[@]}"; do
+                serialized_settings+="$key=${cmd_settings[$key]};"
+            done
+            result=$(timeout "$timeout_duration" "$status_cmd" "$serialized_settings" >/dev/null 2>&1)
+            log_message "DEBUG" "Command $cmd results: $result" "$LINENO"
+        fi
+    else
+        log_message "ERROR" "Unknown status: $status" "$LINENO"
+    fi
+}
+
+# Function: Process connection settings and call the appropriate test function
+process_connection_settings() {
+    local -n connection_settings=$1
+    local group=${connection_settings["GROUP"]}
+    local name=${connection_settings["NAME"]}
+    local check_frequency=${connection_settings["CHECK_FREQUENCY"]}
+
+    create_log_directories "$group"
+
+    log_message "DEBUG" "Connection: '$name'" "$LINENO"
+    local connection_type="${connection_settings["TYPE"]}"
+    log_message "DEBUG" "Connection type: $connection_type" "$LINENO"
+
+    local log_file="$CACHE_DIR/$(normalize_filename "$group")/$(normalize_filename "$name").csv"
+
+    # Check if the log file exists
+    if [[ -f "$log_file" ]]; then
+        # Get the last checked date from the CSV file
+        local last_checked_date=$(awk -F, 'END {print $1}' "$log_file")
+
+        # Convert the date to seconds since epoch
+        if [[ "$OSTYPE" == "linux"* ]]; then
+            local last_checked_seconds=$(date -d "$last_checked_date" +%s)
+        elif [[ "$OSTYPE" == "darwin"* ]]; then
+            local last_checked_seconds=$(date -j -f "%Y-%m-%dT%H:%M:%SZ" "$last_checked_date" +%s)
+        elif [[ "$OSTYPE" == "cygwin" || "$OSTYPE" == "msys" || "$OSTYPE" == "win32" ]]; then
+            local last_checked_seconds=$(date.exe -d "$last_checked_date" +%s)
+        else
+            log_message "ERROR" "Unsupported OS type: $OSTYPE" "$LINENO"
+            return 1
+        fi
+
+        local current_seconds=$(date +%s)
+
+        # Only calculate check_frequency_seconds if check_frequency is defined
+        if [[ ! $FORCE && -n "$check_frequency" ]]; then
+            local check_frequency_seconds=$(get_interval_in_seconds "$check_frequency")
+
+            # Calculate the difference in seconds
+            local time_difference=$((current_seconds - last_checked_seconds))
+
+            # Skip the call if the last checked date is less than or equal to CHECK_FREQUENCY
+            if [[ $time_difference -le $check_frequency_seconds ]]; then
+                log_message "DEBUG" "Skipping check for '$name' as it was checked within the last $check_frequency." "$LINENO"
+                return
+            fi
+        fi
+    fi
+
+    if [[ -n "$connection_type" && " ${CONNECTION_TYPE_MAP[@]} " =~ " $connection_type " ]]; then
+        case "$connection_type" in
+        "PING") test_icmp_reachable connection_settings ;;
+        "ICMP") test_icmp_reachable connection_settings ;;
+        "HTTP") test_https_reachable connection_settings ;;
+        "TCP") test_tcp_reachable connection_settings ;;
+        "SNMP") test_udp_reachable connection_settings ;; # Assuming SNMP uses UDP
+        "UDP") test_udp_reachable connection_settings ;;
+        "CERT") test_certificate_expiry connection_settings ;;
+        "DOMAIN") test_domain_expiry connection_settings ;;
+        esac
+
+        process_connection_results connection_settings
+    else
+        log_message "ERROR" "Unknown connection type: $connection_type" "$LINENO"
+    fi
+}
+
+# ==============================
+# Main Application Execution
+# ==============================
+
+# Function: Start the main process
+main() {
+    local repeat_count=0
+    local interval=$(get_interval_in_seconds "$CHECK_INTERVAL")
+
+    while true; do
+        # Cross-platform timestamp handling
+        local current_time=$(date +%s) # Unix timestamp for calculations
+        local current_timestamp
+        if [[ "$OSTYPE" == "darwin"* ]]; then
+            current_timestamp=$(date -u "+%Y-%m-%dT%H:%M:%SZ")
+        else
+            current_timestamp=$(date -u "+%Y-%m-%dT%H:%M:%SZ")
+        fi
+
+        log_message "DEBUG" "Current timestamp: $current_timestamp" "$LINENO"
+
+        # Main application function calls
+
+        # Get the connection groups
+        local groups=($(get_connection_groups "$CONFIG_FILE"))
+
+        # Check if groups array is empty or null
+        if [[ ${#groups[@]} -eq 0 ]]; then
+            log_message "FATAL" "No connection groups found in the configuration file." "$LINENO"
+            exit 1
+        fi
+
+        # Process the remaining groups
+        for group in "${groups[@]}"; do
+            log_message "DEBUG" "Group: $group" "$LINENO"
+            connections=$(jq -r ".connections[\"$group\"] | length" "$CONFIG_FILE")
+            for ((i = 0; i < connections; i++)); do
+                local -A connection_result
+                get_connection_settings "$group" "$i" "$CONFIG_FILE" connection_result
+                connection_result["GROUP"]=$group
+                process_connection_settings connection_result
+            done
+        done
+
+        # Increment the repeat counter
+        repeat_count=$((repeat_count + 1))
+        log_message "DEBUG" "Iteration: $repeat_count" "$LINENO"
+
+        # Check if REPEAT is set and not zero
+        if [[ -n "$REPEAT" || "$REPEAT" -ne 0 ]] && [[ "$repeat_count" -ge "$REPEAT" ]]; then
+            log_message "DEBUG" "Reached the maximum number of repetitions: $REPEAT" "$LINENO"
+            break
+        else
+            log_message "DEBUG" "Sleeping for $CHECK_INTERVAL" "$LINENO"
+            sleep "$interval"
+        fi
+    done
+}
+
+# Call the function to check for required dependencies
+check_dependencies
+
+# Call the function to parse cli options
+parse_cli_options "$@"
+
+# Call the main function to start the process
+start_process

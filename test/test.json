@@ -1,0 +1,66 @@
+{
+	"configuration": {
+		"CACHE_DIR": "./test/cache/",
+		"LOG_FILE": "./test/cache/test.log",
+		"CHECK_INTERVAL": "60s",
+		"TIMEOUT": "5s",
+		"SYSTEM_NAME": "test system",
+		"PUSHOVER_NOTIFICATION": "false",
+		"PUSHOVER_USER_KEY": "",
+		"PUSHOVER_API_TOKEN": "",
+		"DESKTOP_NOTIFICATION": "true",
+		"VERBOSE": "false",
+		"LOG_LEVEL": "INFO"
+	},
+	"connections": {
+		"default": [
+			{
+				"NAME": "Ping Test",
+				"TYPE": "PING",
+				"HOST": "1.1.1.1",
+				"TIMEOUT": "3s",
+				"PASS_CMD": "./test/test_cmd.sh",
+				"FAIL_CMD": "./test/test_cmd.sh"
+			},
+			{
+				"NAME": "HTTP/S Test",
+				"TYPE": "HTTP",
+				"URL": "google.com",
+				"TIMEOUT": "3s"
+			},
+			{
+				"NAME": "TCP Test",
+				"TYPE": "TCP",
+				"HOST": "www.example.com",
+				"PORT": "443",
+				"TIMEOUT": "5s"
+			},
+			{
+				"NAME": "UDP Test",
+				"TYPE": "UDP",
+				"HOST": "pool.ntp.org",
+				"PORT": "123",
+				"TIMEOUT": "15s"
+			},
+			{
+				"NAME": "Domain Expiry Test",
+				"TYPE": "DOMAIN",
+				"DOMAIN": "google.com",
+				"EXPIRY_DAYS": "200d",
+				"TIMEOUT": "15s",
+				"CHECK_FREQUENCY": "30d"
+			},
+			{
+				"NAME": "Cert Expiry Test",
+				"TYPE": "CERT",
+				"DOMAIN": "google.com",
+				"EXPIRY_DAYS": "30d",
+				"TIMEOUT": "20s",
+				"PASS_CMD": "./test/test_cmd.sh",
+				"FAIL_CMD": "./test/test_cmd.sh",
+				"RECOVERED_CMD": "./test/test_cmd.sh",
+				"CHECK_FREQUENCY": "30d"
+			}
+		]
+	}
+}
