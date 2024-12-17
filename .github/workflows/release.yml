@@ -37,13 +37,6 @@ jobs:
           release_id=$(gh release view "$tag" --json id --jq '.id') || exit 1
           echo "release_id=$release_id" >> $GITHUB_ENV
 
-      - name: Upload APK to release
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          release_id: ${{ env.release_id }}
-        run: |
-          gh release upload "$release_id" path/to/your/package.apk
-
       - name: Download tarball
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
