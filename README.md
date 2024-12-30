@@ -411,7 +411,6 @@ Ensure you have the following installed on your system:
 
 - Docker
 
-
 ### Using the Dockerfile
 
 To download the `Dockerfile` from the GitHub repository, run the following command:
