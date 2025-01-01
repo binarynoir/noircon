@@ -6,8 +6,8 @@
 
 # App version and name
 readonly APP_NAME="NoirCon"
-readonly VERSION=1.0.3
-readonly LAST_UPDATED="2024-12-30"
+readonly VERSION=1.0.4
+readonly LAST_UPDATED="2025-01-01"
 
 # ==============================
 # Application Specific Variables

@@ -9,6 +9,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - none
 
+## [1.0.4] - 2025-01-01
+
+### Fixed
+
+- Issue where script would not run
+
 ## [1.0.3] - 2024-12-30
 
 ### Fixed
